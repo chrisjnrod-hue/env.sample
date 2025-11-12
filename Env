@@ -1,0 +1,40 @@
+# Minimal environment for Render (do NOT commit real secrets)
+
+# App / storage
+STORE=sqlite
+SQLITE_DB_PATH=data.db
+
+# Bybit API base (usually default)
+BYBIT_REST_BASE=https://api.bybit.com
+
+# Rate limiter (tune if you see rate errors)
+REST_MAX_TOKENS=500
+REST_REFILL_SECONDS=7
+
+# MACD params
+MACD_FAST=12
+MACD_SLOW=26
+MACD_SIGNAL=9
+
+# Backfill and retention
+BACKFILL_TFS=1440,240,60
+BACKFILL_LIMIT=200
+MAX_CANDLES=100
+LAZY_TFS=5,15
+LAZY_TF_MAX_CANDLES=300
+
+# Scheduler / performance
+BATCH_SIZE=40
+TRIM_INTERVAL_MINUTES=60
+
+# Optional but recommended
+CRON_SECRET=your_cron_secret_here        # set and configure cron-job.org header X-Cron-Secret
+TELEGRAM_BOT_TOKEN=                      # set if you want Telegram alerts
+TELEGRAM_CHAT_ID=                        # set if using Telegram
+
+# Optional: set when switching to Redis
+# STORE=redis
+# REDIS_URL=redis://:password@host:port/0
+
+# Render sets PORT automatically; you normally don't need to set it here.
+# PORT=8000
