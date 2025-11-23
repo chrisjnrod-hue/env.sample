@@ -1,1 +1,126 @@
-.
+# ---------------- Safe-mode MACD flip detection (drop-in replacement) ----------------
+# Configurable via env or hard defaults below:
+FLIP_HIST_THRESHOLD = float(os.getenv("FLIP_HIST_THRESHOLD", "0.0005"))  # minimum hist > this to count as a real flip
+FLIP_MIN_NEG_CANDLES = int(os.getenv("FLIP_MIN_NEG_CANDLES", "2"))      # how many previous hist bars must be <= 0
+FLIP_MIN_OBS_COUNT = int(os.getenv("FLIP_MIN_OBS_COUNT", "2"))         # require this many mid-candle observations if FLIP_STABILITY_SECONDS==0
+
+async def detect_flip(symbol: str, tf: str) -> Tuple[Optional[str], Optional[int]]:
+    """
+    Safe-mode flip detection (open-only).
+    Returns ("open", last_start) when the most-recent in-progress candle moved from
+    hist <= 0 (for FLIP_MIN_NEG_CANDLES bars) to hist > FLIP_HIST_THRESHOLD and
+    stability/observation requirements are met.
+    Otherwise returns (None, None).
+    """
+    try:
+        token = TF_MAP[tf]
+    except Exception:
+        # allow tf passed as token sometimes
+        token = TF_MAP.get(tf, tf)
+
+    # ensure cache is present
+    await ensure_cached_candles(symbol, tf, MIN_CANDLES_REQUIRED)
+    dq = cache_get(symbol, token)
+    if not dq or len(dq) < MIN_CANDLES_REQUIRED:
+        return None, None
+
+    # last candle start & closed-check
+    last = list(dq)[-1]
+    last_start = last.get("start")
+    if last_start is None:
+        return None, None
+
+    # if last candle closed -> purge any registry entry and ignore (we only do open flips)
+    if last_candle_is_closed(dq, token, safety_seconds=3):
+        observed_flip_registry.pop((symbol, token, last_start), None)
+        return None, None
+
+    # compute MACD histogram over closes
+    closes = candles_to_closes(dq)
+    if len(closes) < MACD_SLOW + MACD_SIGNAL:
+        return None, None
+    hist = macd_hist(closes)
+    if not hist or len(hist) < 2:
+        return None, None
+
+    prev_hist = hist[-2] or 0.0
+    cur_hist = hist[-1] or 0.0
+
+    # primary numeric guard: require crossing from <=0 to > threshold
+    if not (prev_hist <= 0.0 and cur_hist > FLIP_HIST_THRESHOLD):
+        return None, None
+
+    # secondary guard: ensure previous N candles' hist were non-positive
+    if FLIP_MIN_NEG_CANDLES > 0:
+        # look back N bars before the last (i.e. hist[-(1+N)] ... hist[-2])
+        start_idx = max(0, len(hist) - 1 - FLIP_MIN_NEG_CANDLES)
+        slice_prev = hist[start_idx: len(hist) - 1]
+        # If any of these is > 0 then the flip might be coming from noisy oscillation
+        if any((h or 0.0) > 0.0 for h in slice_prev):
+            return None, None
+
+    # record observation in registry (for mid-candle stability / repeated WS updates)
+    now_s = int(time.time())
+    key = (symbol, token, last_start)
+    rec = observed_flip_registry.get(key)
+    if rec is None:
+        observed_flip_registry[key] = {"first_seen": now_s, "last_seen": now_s, "count": 1, "max_hist": cur_hist, "min_prev_hist": prev_hist}
+    else:
+        rec["last_seen"] = now_s
+        rec["count"] = rec.get("count", 0) + 1
+        # keep the maximum current hist observed (helps if hist grows)
+        if cur_hist > rec.get("max_hist", 0.0):
+            rec["max_hist"] = cur_hist
+        # keep the smallest prev_hist seen (safety)
+        if prev_hist < rec.get("min_prev_hist", 0.0):
+            rec["min_prev_hist"] = prev_hist
+        observed_flip_registry[key] = rec
+
+    # Stability decision:
+    # - If FLIP_STABILITY_SECONDS > 0: require the flip's first_seen to be at least that many seconds ago.
+    # - If FLIP_STABILITY_SECONDS == 0: allow flip if we've seen it multiple times (FLIP_MIN_OBS_COUNT).
+    if FLIP_STABILITY_SECONDS > 0:
+        if (now_s - observed_flip_registry[key]["first_seen"]) < FLIP_STABILITY_SECONDS:
+            # not stable yet
+            return None, None
+    else:
+        if observed_flip_registry[key]["count"] < FLIP_MIN_OBS_COUNT:
+            return None, None
+
+    # all checks passed -> declare an open flip
+    return "open", last_start
+
+def flip_is_stable(symbol: str, tf: str, start: int) -> bool:
+    """
+    Helper to decide whether an observed flip (symbol,tf,start) is stable.
+    Kept for backward compatibility with other code that may call flip_is_stable.
+    """
+    if FLIP_STABILITY_SECONDS <= 0:
+        # if stability window disabled, rely on observation count
+        token = TF_MAP.get(tf) if tf in TF_MAP else tf
+        key = (symbol, token, start)
+        rec = observed_flip_registry.get(key)
+        if not rec:
+            return False
+        return rec.get("count", 0) >= FLIP_MIN_OBS_COUNT
+    else:
+        token = TF_MAP.get(tf) if tf in TF_MAP else tf
+        key = (symbol, token, start)
+        rec = observed_flip_registry.get(key)
+        if not rec:
+            return False
+        return (int(time.time()) - int(rec["first_seen"])) >= FLIP_STABILITY_SECONDS
+
+# Optional: small cleanup utility you can schedule periodically (not required)
+def purge_old_flip_registry(max_age_seconds: int = 3600):
+    """
+    Remove flip registry entries older than max_age_seconds to avoid unbounded growth.
+    Call from a lightweight background task occasionally if you like.
+    """
+    now_s = int(time.time())
+    to_del = []
+    for k, v in observed_flip_registry.items():
+        if (now_s - v.get("last_seen", 0)) > max_age_seconds:
+            to_del.append(k)
+    for k in to_del:
+        observed_flip_registry.pop(k, None)
